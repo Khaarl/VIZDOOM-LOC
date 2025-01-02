@@ -14,6 +14,7 @@ import glob
 import psutil  # For RAM usage
 import gc  # For garbage collection
 from collections import Counter
+import cv2
 
 # --- Configuration ---
 RECORD_LMP = False  # Set to True to record .lmp demo files
@@ -218,15 +219,19 @@ class DQNAgent:
     def update_target_network(self):
         self.target_net.load_state_dict(self.policy_net.state_dict())
 
+# --- User Input for Training Parameters ---
+print("Enter training parameters (press Enter to use default values):")
+
+MODEL_SAVE_FREQ = int(input(f"  Model Save Frequency (episodes between saves, default: {10}): ") or "10")
+BATCH_SIZE = int(input(f"  Batch Size (default: {64}): ") or "64")
+MEMORY_CAPACITY = int(input(f"  Memory Capacity (default: {10000}): ") or "10000")
+LEARNING_RATE = float(input(f"  Learning Rate (default: {0.0001}): ") or "0.0001")
+
 # --- Training Parameters ---
-LEARNING_RATE = 0.0001
 GAMMA = 0.99
 EPSILON_START = 1.0
 EPSILON_END = 0.05
 EPSILON_DECAY = 0.995
-MEMORY_CAPACITY = 10000
-BATCH_SIZE = 64
-TARGET_UPDATE_FREQ = 10
 # NUM_EPISODES is set via user input earlier
 # FRAME_SKIP values are set via user input earlier
 
@@ -252,8 +257,7 @@ actions = np.identity(num_actions, dtype=int).tolist()
 # --- Get initial state shape ---
 screen_height, screen_width = game.get_screen_height(), game.get_screen_width()
 channels = game.get_screen_channels()
-# state_shape = (channels, screen_height, screen_width) # Update state_shape
-state_shape = (STACK_SIZE * channels, screen_height, screen_width) # Update state_shape for stacked frames
+state_shape = (STACK_SIZE * channels, 84, 84) # Update state_shape for stacked frames
 
 # --- Scan for existing models ---
 model_files = glob.glob(os.path.join(DRIVE_MODEL_DIR, "*.pth"))
@@ -311,27 +315,52 @@ def preprocess_frame(frame):
     if len(frame.shape) == 3 and frame.shape[0] == 3:
         frame = np.mean(frame, axis=0)
     frame = frame.astype(np.float32) / 255.0
+    frame = cv2.resize(frame, (84, 84), interpolation=cv2.INTER_AREA)
+    # Transpose to (channels, height, width)
+    # Assuming frame is originally in (height, width, channels) format
+    if len(frame.shape) == 3:  # Color image
+        frame = frame.transpose(2, 0, 1)
+    else:  # Grayscale, add a channel dimension
+        frame = np.expand_dims(frame, axis=0)
     return frame
 
 def create_stacked_state(state_buffer):
     processed_frames = [preprocess_frame(f) for f in state_buffer]
-    stacked_state = np.stack(processed_frames, axis=0)
+    # Ensure all frames are not None and have the same shape
+    if any(f is None for f in processed_frames) or not all(f.shape == processed_frames[0].shape for f in processed_frames):
+        print("Error: Inconsistent or None frames in processed_frames")
+        return None
+
+    stacked_state = np.concatenate(processed_frames, axis=0)
     return stacked_state
 
 # --- Training Loop ---
-TICRATE = 35 # Internal ticrate of ViZDoom (for syncing with video FPS, if needed)
+TICRATE = 35  # Internal ticrate of ViZDoom (for syncing with video FPS, if needed)
+
+# --- Get current date and time for file name prefix ---
+now = datetime.now()
+dt_string = now.strftime("%Y%m%d%H%M")  # Format: YYYYMMDDHHMM
 
 for episode in range(NUM_EPISODES):
     if RECORD_LMP:
-        lmp_file_path = os.path.join(LMP_DIR, f"episode_{episode+1}.lmp")
+        lmp_file_path = os.path.join(LMP_DIR, f"episode_{episode + 1}.lmp")
         game.new_episode(lmp_file_path)
     else:
         game.new_episode()
 
+    # --- Print available game variables and their indices ---
+    if episode == 0:  # Print only once at the beginning
+        print("Available Game Variables:")
+        for i, var in enumerate(game.get_available_game_variables()):
+            print(f"  Index {i}: {var}")
+
     # --- Initialize state with frame stacking ---
     game_state = game.get_state()
-    state_buffer = [game_state.screen_buffer] * STACK_SIZE  # Initialize buffer with repeated first frame
+    state_buffer = [game_state.screen_buffer] * STACK_SIZE  # Initialize buffer
     state = create_stacked_state(state_buffer)
+    if state is None:
+        print(f"Skipping episode {episode + 1} due to state initialization error.")
+        continue
 
     total_reward = 0
     step_count = 0
@@ -354,16 +383,20 @@ for episode in range(NUM_EPISODES):
         reward = game.make_action(action, FRAME_SKIP)
         done = game.is_episode_finished()
 
-        # --- Get game variables and update state buffer---
+        # --- Get game variables and update state buffer ---
         if not done:
             game_state = game.get_state()
             next_frame = game_state.screen_buffer
             state_buffer.pop(0)  # Remove oldest frame
             state_buffer.append(next_frame)  # Add new frame
             next_state = create_stacked_state(state_buffer)  # Create stacked state
+            if next_state is None:
+                print(f"Error: next_state is None in episode {episode + 1} at step {step_count + 1}.")
+                break
 
-            damage_taken += game_state.game_variables[0]  # DAMAGECOUNT is at index 0
-            damage_inflicted += game_state.game_variables[2]  # KILLCOUNT is at index 2
+            # Update with CORRECT indices from the printed output
+            damage_taken += game_state.game_variables[0]  # Replace 0 with the correct index
+            damage_inflicted += game_state.game_variables[1]  # Replace 1 with the correct index
         else:
             next_state = np.zeros(state_shape)
 
@@ -374,8 +407,10 @@ for episode in range(NUM_EPISODES):
         total_reward += reward
         step_count += 1
 
-        if RECORD_VIDEO and state is not None:
-            writer.append_data(state.transpose(1, 2, 0))
+        # Changed Recording code here
+        if RECORD_VIDEO and not done:
+          most_recent_frame = state_buffer[-1]
+          writer.append_data(most_recent_frame)
 
         if done:
             break
@@ -387,7 +422,12 @@ for episode in range(NUM_EPISODES):
     episode_damage_taken.append(damage_taken)
     episode_damage_inflicted.append(damage_inflicted)
     agent.update_epsilon()
-    if episode % TARGET_UPDATE_FREQ == 0:
+    if episode % MODEL_SAVE_FREQ == 0:
+      # --- Save the trained model ---
+      model_filename = f"{dt_string}_dqn_model_episode_{episode + 1}.pth"
+      model_path = os.path.join(DRIVE_MODEL_DIR, model_filename)
+      torch.save(agent.policy_net.state_dict(), model_path)
+    if episode % 10 == 0:
         agent.update_target_network()
 
     # --- Calculate action diversity ---
@@ -414,10 +454,6 @@ for episode in range(NUM_EPISODES):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-# --- Get current date and time for file name prefix ---
-now = datetime.now()
-dt_string = now.strftime("%Y%m%d%H%M")  # Format: YYYYMMDDHHMM
-
 # --- Save metrics to CSV ---
 training_end_time = time.time()
 metrics_df = pd.DataFrame({
@@ -431,17 +467,16 @@ metrics_df = pd.DataFrame({
     'damage_inflicted': episode_damage_inflicted,
     'ram_usage': ram_usage,
     'gpu_memory_usage': gpu_memory_usage,
-    'action_diversity': action_diversity
+    'action_diversity': action_diversity,
+    'model_save_freq': MODEL_SAVE_FREQ,
+    'batch_size': BATCH_SIZE,
+    'memory_capacity': MEMORY_CAPACITY,
+    'learning_rate': LEARNING_RATE
 })
 
 metrics_filename = f"{dt_string}_training_metrics.csv"
 metrics_path = os.path.join(DRIVE_MODEL_DIR, metrics_filename)
 metrics_df.to_csv(metrics_path, index=False)
-
-# --- Save the trained model ---
-model_filename = f"{dt_string}_dqn_model.pth"
-model_path = os.path.join(DRIVE_MODEL_DIR, model_filename)
-torch.save(agent.policy_net.state_dict(), model_path)
 
 # Close the writer
 if RECORD_VIDEO:
