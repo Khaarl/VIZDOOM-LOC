@@ -11,15 +11,23 @@ import random
 import pandas as pd
 from datetime import datetime
 import glob
+import psutil  # For RAM usage
+import gc  # For garbage collection
+from collections import Counter
 
 # --- Configuration ---
-RECORD_LMP = False       # Set to True to record .lmp demo files
-RECORD_VIDEO = False     # Set to True to record a video (MP4)
-VIDEO_FPS = 30          # Frames per second for video recording
+RECORD_LMP = False  # Set to True to record .lmp demo files
+RECORD_VIDEO = False  # Set to True to record a video (MP4)
+VIDEO_FPS = 30  # Frames per second for video recording
 LMP_DIR = "lmp_recordings"  # Directory to save .lmp files
-SCENARIO_NAME = "defend_the_center.cfg"  # Change the scenario name here
+SCENARIO_NAME = "defend_the_center.cfg"  # Default scenario
 # --- Google Drive Paths ---
 DRIVE_MODEL_DIR = "/content/drive/My Drive/ViZDoomModels"  # Directory in Google Drive to save the model
+DRIVE_WAD_DIR = "/content/drive/My Drive/ViZDoomWADs"  # Directory in Google Drive for WAD files
+# --- Local Paths ---
+LOCAL_WAD_DIR = "/content/ViZDoomWADs"
+# --- Frame Stacking ---
+STACK_SIZE = 4  # Number of frames to stack
 
 # --- User Input for Recording, Number of Episodes, and FRAME_SKIP ---
 record_choice = input("Do you want to record the game? (yes/no): ").lower()
@@ -50,7 +58,63 @@ VIDEO_DIR = "/content/drive/My Drive/ViZDoomRecordings"
 VIDEO_FILENAME = "game_recording.mp4"
 VIDEO_PATH = os.path.join(VIDEO_DIR, VIDEO_FILENAME)
 os.makedirs(VIDEO_DIR, exist_ok=True)
-os.makedirs(DRIVE_MODEL_DIR, exist_ok=True)  # Create model directory in Drive if it doesn't exist
+os.makedirs(DRIVE_MODEL_DIR, exist_ok=True)
+os.makedirs(DRIVE_WAD_DIR, exist_ok=True)  # Create WAD directory on GDrive
+os.makedirs(LOCAL_WAD_DIR, exist_ok=True)  # Create WAD directory locally
+
+# --- Ask user for WAD choice ---
+print("Choose a WAD file to use:")
+print("1. Use current scenario WAD (defend_the_center.cfg with vizdoom assets)")
+print("2. Use original Doom WAD from Google Drive (ViZDoomWADs folder with defend_the_center.cfg)")
+wad_choice = input("Enter your choice (1 or 2): ")
+
+if wad_choice == "1":
+    # Use the default scenario WAD with vizdoom assets
+    import vizdoom
+    vizdoom_path = os.path.dirname(vizdoom.__file__)
+    SCENARIO_PATH = os.path.join(vizdoom_path, "scenarios", SCENARIO_NAME)
+    wad_path = None  # No specific WAD, will use the one defined in the CFG
+
+elif wad_choice == "2":
+    # Use a WAD from Google Drive (copy to local, then use)
+    wad_files = glob.glob(os.path.join(DRIVE_WAD_DIR, "*.wad"))
+    if wad_files:
+        print("Available WAD files in ViZDoomWADs:")
+        for i, file in enumerate(wad_files):
+            print(f"{i+1}. {os.path.basename(file)}")
+        wad_file_choice = input("Enter the number of the WAD file to use: ")
+        try:
+            wad_file_choice = int(wad_file_choice)
+            if 1 <= wad_file_choice <= len(wad_files):
+                wad_path = wad_files[wad_file_choice - 1]
+                local_wad_path = os.path.join(LOCAL_WAD_DIR, os.path.basename(wad_path))
+                # Copy the WAD file from Google Drive to the local directory
+                if not os.path.exists(local_wad_path):
+                    print(f"Copying {os.path.basename(wad_path)} from Google Drive to local...")
+                    import shutil
+                    shutil.copy(wad_path, local_wad_path)
+                    print("Copy complete.")
+                else:
+                    print(f"{os.path.basename(wad_path)} already exists locally. Using local copy.")
+                wad_path = local_wad_path
+
+                # Update scenario to defend_the_center.cfg (should be compatible)
+                SCENARIO_NAME = "defend_the_center.cfg"
+                import vizdoom
+                vizdoom_path = os.path.dirname(vizdoom.__file__)
+                SCENARIO_PATH = os.path.join(vizdoom_path, "scenarios", SCENARIO_NAME)
+
+            else:
+                raise ValueError("Invalid WAD file choice.")
+        except ValueError:
+            print("Invalid input. Using default scenario.")
+            wad_path = None  # Default back to scenario WAD
+    else:
+        print("No WAD files found in ViZDoomWADs. Using default scenario.")
+        wad_path = None  # Default back to scenario WAD
+else:
+    print("Invalid choice. Using default scenario.")
+    wad_path = None  # Default back to scenario WAD
 
 # --- DQN ---
 class DQN(nn.Module):
@@ -168,17 +232,15 @@ TARGET_UPDATE_FREQ = 10
 
 # --- ViZDoom Setup ---
 game = DoomGame()
-import vizdoom
-vizdoom_path = os.path.dirname(vizdoom.__file__)
-SCENARIO_PATH = os.path.join(vizdoom_path, "scenarios", SCENARIO_NAME)
 game.load_config(SCENARIO_PATH)
+if wad_path:
+    game.set_doom_game_path(wad_path)  # Set path to the Doom WAD
 game.set_window_visible(False)
 game.set_screen_format(ScreenFormat.RGB24)
 game.set_screen_resolution(ScreenResolution.RES_320X240)
 
 if RECORD_LMP:
     game.set_mode(Mode.PLAYER)
-    game.set_doom_scenario_path(SCENARIO_PATH)
     os.makedirs(LMP_DIR, exist_ok=True)
 
 game.init()
@@ -190,7 +252,8 @@ actions = np.identity(num_actions, dtype=int).tolist()
 # --- Get initial state shape ---
 screen_height, screen_width = game.get_screen_height(), game.get_screen_width()
 channels = game.get_screen_channels()
-state_shape = (channels, screen_height, screen_width)
+# state_shape = (channels, screen_height, screen_width) # Update state_shape
+state_shape = (STACK_SIZE * channels, screen_height, screen_width) # Update state_shape for stacked frames
 
 # --- Scan for existing models ---
 model_files = glob.glob(os.path.join(DRIVE_MODEL_DIR, "*.pth"))
@@ -209,7 +272,7 @@ if model_files:
             # Load existing model
             model_path = model_files[choice - 1]
             agent = DQNAgent(state_shape, num_actions, LEARNING_RATE, GAMMA, EPSILON_START, EPSILON_END, EPSILON_DECAY, MEMORY_CAPACITY, BATCH_SIZE)
-            agent.policy_net.load_state_dict(torch.load(model_path))
+            agent.policy_net.load_state_dict(torch.load(model_path, weights_only=True))  # Load with weights_only=True
             agent.target_net.load_state_dict(agent.policy_net.state_dict())
             print(f"Model loaded from {model_path}")
           else:
@@ -236,7 +299,24 @@ if RECORD_VIDEO:
 # --- Tracking Variables ---
 episode_rewards = []  # List to store rewards per episode
 episode_lengths = []  # List to store the number of steps per episode
+episode_damage_taken = [] # List to store damage taken per episode
+episode_damage_inflicted = [] # List to store damage inflicted per episode
+episode_survival_times = [] # List to store survival time per episode
+inference_times = [] # List to store inference times
 training_start_time = time.time()
+
+# --- Frame Stacking ---
+def preprocess_frame(frame):
+    # Convert to grayscale (if necessary) and normalize
+    if len(frame.shape) == 3 and frame.shape[0] == 3:
+        frame = np.mean(frame, axis=0)
+    frame = frame.astype(np.float32) / 255.0
+    return frame
+
+def create_stacked_state(state_buffer):
+    processed_frames = [preprocess_frame(f) for f in state_buffer]
+    stacked_state = np.stack(processed_frames, axis=0)
+    return stacked_state
 
 # --- Training Loop ---
 TICRATE = 35 # Internal ticrate of ViZDoom (for syncing with video FPS, if needed)
@@ -248,22 +328,42 @@ for episode in range(NUM_EPISODES):
     else:
         game.new_episode()
 
-    state = game.get_state().screen_buffer
-    state = np.transpose(state, (2, 0, 1))
+    # --- Initialize state with frame stacking ---
+    game_state = game.get_state()
+    state_buffer = [game_state.screen_buffer] * STACK_SIZE  # Initialize buffer with repeated first frame
+    state = create_stacked_state(state_buffer)
+
     total_reward = 0
     step_count = 0
+    episode_start_time = time.time()
+    damage_taken = 0
+    damage_inflicted = 0
+    action_counts = Counter()
 
     while not game.is_episode_finished():
+        # --- Measure inference time ---
+        inference_start_time = time.time()
         action_index = agent.select_action(state)
+        inference_end_time = time.time()
+        inference_times.append(inference_end_time - inference_start_time)
+
         action = actions[action_index]
+        action_counts[action_index] += 1
 
         # Make the action with the appropriate FRAME_SKIP value
-        reward = game.make_action(action, FRAME_SKIP) 
+        reward = game.make_action(action, FRAME_SKIP)
         done = game.is_episode_finished()
 
+        # --- Get game variables and update state buffer---
         if not done:
-            next_state = game.get_state().screen_buffer
-            next_state = np.transpose(next_state, (2, 0, 1))
+            game_state = game.get_state()
+            next_frame = game_state.screen_buffer
+            state_buffer.pop(0)  # Remove oldest frame
+            state_buffer.append(next_frame)  # Add new frame
+            next_state = create_stacked_state(state_buffer)  # Create stacked state
+
+            damage_taken += game_state.game_variables[0]  # DAMAGECOUNT is at index 0
+            damage_inflicted += game_state.game_variables[2]  # KILLCOUNT is at index 2
         else:
             next_state = np.zeros(state_shape)
 
@@ -280,15 +380,39 @@ for episode in range(NUM_EPISODES):
         if done:
             break
 
+    episode_survival_time = time.time() - episode_start_time
+    episode_survival_times.append(episode_survival_time)
     episode_rewards.append(total_reward)
     episode_lengths.append(step_count)
+    episode_damage_taken.append(damage_taken)
+    episode_damage_inflicted.append(damage_inflicted)
     agent.update_epsilon()
     if episode % TARGET_UPDATE_FREQ == 0:
         agent.update_target_network()
 
+    # --- Calculate action diversity ---
+    total_actions = sum(action_counts.values())
+    action_diversity = sum(count / total_actions for count in action_counts.values()) / num_actions
+
+    # --- Get memory usage ---
+    process = psutil.Process(os.getpid())
+    ram_usage = process.memory_info().rss / 1024**2  # in MB
+    if torch.cuda.is_available():
+        gpu_memory_usage = torch.cuda.max_memory_allocated() / 1024**2 # in MB
+    else:
+      gpu_memory_usage = 0
+
     # --- Logging ---
     avg_reward = np.mean(episode_rewards[-100:])
-    print(f"Episode {episode+1}/{NUM_EPISODES}, Total Reward: {total_reward}, Steps: {step_count}, Epsilon: {agent.epsilon:.3f}, Avg Reward (last 100): {avg_reward:.2f}")
+    avg_survival_time = np.mean(episode_survival_times[-100:])
+    avg_inference_time = np.mean(inference_times[-100:])
+    print(f"Episode {episode+1}/{NUM_EPISODES}, Total Reward: {total_reward}, Steps: {step_count}, Epsilon: {agent.epsilon:.3f}, Avg Reward (last 100): {avg_reward:.2f}, Survival Time: {episode_survival_time:.2f}s, Avg Survival Time (last 100): {avg_survival_time:.2f}s, Damage Taken: {damage_taken}, Damage Inflicted: {damage_inflicted}, Avg Inference Time: {avg_inference_time:.4f}s, RAM Usage: {ram_usage:.2f}MB, GPU Mem Usage: {gpu_memory_usage:.2f}MB, Action Diversity: {action_diversity:.2f}")
+
+    # --- Clear memory ---
+    del action_counts
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 # --- Get current date and time for file name prefix ---
 now = datetime.now()
@@ -301,7 +425,13 @@ metrics_df = pd.DataFrame({
     'reward': episode_rewards,
     'steps': episode_lengths,
     'epsilon': [EPSILON_START * (EPSILON_DECAY ** i) for i in range(NUM_EPISODES)],
-    'training_time': training_end_time - training_start_time
+    'training_time': training_end_time - training_start_time,
+    'survival_time': episode_survival_times,
+    'damage_taken': episode_damage_taken,
+    'damage_inflicted': episode_damage_inflicted,
+    'ram_usage': ram_usage,
+    'gpu_memory_usage': gpu_memory_usage,
+    'action_diversity': action_diversity
 })
 
 metrics_filename = f"{dt_string}_training_metrics.csv"
